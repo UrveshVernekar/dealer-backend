@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  # Database Service
+  db:
+    image: postgres:15-alpine
+    container_name: dealer_postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: materialsuser
+      POSTGRES_PASSWORD: materials1234#$
+      POSTGRES_DB: dealer_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # FastAPI Web Application Service
+  web:
+    build: .
+    container_name: dealer_fastapi_web
+    restart: always
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://materialsuser:materials1234#$@db:5432/dealer_db
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
