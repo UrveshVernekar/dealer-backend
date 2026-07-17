@@ -43,6 +43,7 @@ venv.bak/
 *.xlsx
 *.csv
 *.json
+*.py
 
 # Pytest / Coverage
 .pytest_cache/

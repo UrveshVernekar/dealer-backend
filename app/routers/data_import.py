@@ -1,5 +1,6 @@
 import io
 import pandas as pd
+import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -234,4 +235,201 @@ def download_table(
         headers=headers,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+def get_column(df, candidates, default=0):
+    for c in candidates:
+        if c in df.columns:
+            return pd.to_numeric(df[c], errors='coerce').fillna(default)
+    return pd.Series(default, index=df.index)
+
+
+def run_outcome_calculation(db: Session):
+    for t in ["new_scheme", "dealer_sku"]:
+        exists = db.execute(text(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :t)"
+        ), {"t": t}).scalar()
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Required table '{t}' does not exist yet. Please upload dealer data Excel sheets first."
+            )
+            
+    df1 = pd.read_sql_query("SELECT * FROM dealer_sku", con=engine)
+    df2 = pd.read_sql_query("SELECT * FROM new_scheme", con=engine)
+    
+    target_states = [
+        "tamilnadu", "tamil nadu", "kerela", "kerala", "westbengal", "west bengal", 
+        "bihar", "jharkand", "jharkhand", "odisha", "orissa", "northeast", "north east", 
+        "north-east", "chattisgarh", "chhattisgarh", "madhya pradesh", "madhyapradesh", 
+        "gujarat", "gujrat", "mumbai", "pune", "vidharbha", "delhi", "rajasthan", 
+        "rajastan", "uttar pradesh", "uttarpradesh", "uttarakhand", "uttarkhand"
+    ]
+    
+    if "so_region" in df1.columns:
+        df1 = df1[df1["so_region"].str.lower().isin(target_states)].copy()
+    if "branch" in df2.columns:
+        df2 = df2[df2["branch"].str.lower().isin(target_states)].copy()
+        
+    if len(df1) > 0 and len(df2) > 0:
+        df1["new_sold_to_party"] = df1["new_sold_to_party"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        df1["material_code"] = df1["material_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        df2["sold_to_party_code"] = df2["sold_to_party_code"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        df2["material_id"] = df2["material_id"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+        
+        merged_df = pd.merge(
+            df1,
+            df2,
+            left_on=["new_sold_to_party", "material_code"],
+            right_on=["sold_to_party_code", "material_id"],
+            how="inner"
+        )
+    else:
+        merged_df = pd.DataFrame()
+        
+    export_cols = [
+        'new_sold_to_party', 'dealer_name', 'product_mapping', 'material_code',
+        'material_description', 'sum_of_sum_of_tie_up_schemes', 'sum_of_sum_of_cash_discount',
+        'sum_of_sum_of_foi', 'sum_of_updated_iq_ac_adj_', 'mrp', 'dp', 'iq_dp',
+        'current_scheme', 'on_invoice_discount', 'on_invoice_discount_iq_dp',
+        'cash_discount', 'cd_iq_dp', 'sell_through', 'sell_through_iq_dp',
+        'sell_out', 'sell_out_iq_dp', 'mthly_on_vol_tie_up', 'qtrly_on_vol_tie_up',
+        'old_discount', 'new_discount'
+    ]
+    
+    export_df = pd.DataFrame(columns=export_cols)
+    
+    if len(merged_df) > 0:
+        iq_dp = (get_column(merged_df, ['dp']) / 1.18) * get_column(merged_df, ['sum_of_updated_iq_ac_adj_'])
+        on_invoice_discount_iq_dp = iq_dp * get_column(merged_df, ['on_invoice_discount'])
+        sell_through_iq_dp = iq_dp * get_column(merged_df, ['sell', 'sell_through'])
+        sell_out_iq_dp = iq_dp * get_column(merged_df, ['sell_3', 'sellout_support_'])
+        cd_iq_dp = (iq_dp - on_invoice_discount_iq_dp) * get_column(merged_df, ['cash_discount', 'cd_'])
+        old_discount = get_column(merged_df, ['sum_of_sum_of_total_discount'])
+        new_discount = on_invoice_discount_iq_dp + cd_iq_dp + sell_through_iq_dp + sell_out_iq_dp
+        
+        export_df['new_sold_to_party'] = get_column(merged_df, ['new_sold_to_party'])
+        export_df['dealer_name'] = get_column(merged_df, ['dealer_name'])
+        export_df['product_mapping'] = get_column(merged_df, ['product_mapping'])
+        export_df['material_code'] = get_column(merged_df, ['material_code'])
+        export_df['material_description'] = get_column(merged_df, ['material_description'])
+        export_df['sum_of_sum_of_tie_up_schemes'] = get_column(merged_df, ['sum_of_sum_of_tie_up_schemes'])
+        export_df['sum_of_sum_of_cash_discount'] = get_column(merged_df, ['sum_of_sum_of_cash_discount'])
+        export_df['sum_of_sum_of_foi'] = get_column(merged_df, ['sum_of_sum_of_foi'])
+        export_df['sum_of_updated_iq_ac_adj_'] = get_column(merged_df, ['sum_of_updated_iq_ac_adj_'])
+        export_df['mrp'] = get_column(merged_df, ['mrp'])
+        export_df['dp'] = get_column(merged_df, ['dp'])
+        export_df['iq_dp'] = iq_dp
+        export_df['current_scheme'] = get_column(merged_df, ['current_scheme'])
+        export_df['on_invoice_discount'] = get_column(merged_df, ['on_invoice_discount'])
+        export_df['on_invoice_discount_iq_dp'] = on_invoice_discount_iq_dp
+        export_df['cash_discount'] = get_column(merged_df, ['cash_discount', 'cd_'])
+        export_df['cd_iq_dp'] = cd_iq_dp
+        export_df['sell_through'] = get_column(merged_df, ['sell', 'sell_through'])
+        export_df['sell_through_iq_dp'] = sell_through_iq_dp
+        export_df['sell_out'] = get_column(merged_df, ['sell_3', 'sellout_support_'])
+        export_df['sell_out_iq_dp'] = sell_out_iq_dp
+        export_df['mthly_on_vol_tie_up'] = get_column(merged_df, ['mthly', 'mthly_1'])
+        export_df['qtrly_on_vol_tie_up'] = get_column(merged_df, ['qtrly', 'qtrly_1'])
+        export_df['old_discount'] = old_discount
+        export_df['new_discount'] = new_discount
+        
+        total_old = float(old_discount.sum())
+        total_new = float(new_discount.sum())
+    else:
+        total_old = 0.0
+        total_new = 0.0
+        
+    delta = total_old - total_new
+    return export_df, total_old, total_new, delta
+
+
+@router.get("/outcome")
+def get_scheme_outcome(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user)
+):
+    try:
+        export_df, total_old, total_new, delta = run_outcome_calculation(db)
+        columns = list(export_df.columns)
+        rows = export_df.to_dict(orient="records")
+        
+        # Format nan values to None/null for JSON standard compliance
+        for row in rows:
+            for k, v in row.items():
+                if isinstance(v, float) and np.isnan(v):
+                    row[k] = None
+                    
+        return {
+            "columns": columns,
+            "rows": rows,
+            "summary": {
+                "total_old": total_old,
+                "total_new": total_new,
+                "delta": delta
+            }
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred during outcome generation: {str(e)}"
+        )
+
+
+@router.get("/outcome/download")
+def download_scheme_outcome(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user)
+):
+    try:
+        export_df, total_old, total_new, delta = run_outcome_calculation(db)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            export_df.to_excel(writer, sheet_name="Outcome", index=False)
+            
+            # Aligned Grand Total Block at the bottom of sheet
+            start_row = len(export_df) + 2
+            try:
+                start_col = list(export_df.columns).index("old_discount")
+            except ValueError:
+                start_col = max(0, len(export_df.columns) - 4)
+                
+            summary_df = pd.DataFrame({
+                "Metric": ["Grand Total"],
+                "Old_discount": [total_old],
+                "New_discount": [total_new],
+                "Delta": [delta]
+            })
+            
+            summary_df.to_excel(
+                writer,
+                sheet_name="Outcome",
+                startrow=start_row,
+                startcol=start_col,
+                index=False
+            )
+            
+        buffer.seek(0)
+        
+        headers = {
+            'Content-Disposition': 'attachment; filename="outcome.xlsx"'
+        }
+        return StreamingResponse(
+            buffer,
+            headers=headers,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate spreadsheet download: {str(e)}"
+        )
+
 
