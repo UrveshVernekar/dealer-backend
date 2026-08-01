@@ -11,7 +11,8 @@ services:
       POSTGRES_PASSWORD: materials1234#$
       POSTGRES_DB: dealer_db
     ports:
-      - "5432:5432"
+      # Maps local machine port 5433 to container port 5432
+      - "${HOST_DB_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
@@ -24,9 +25,11 @@ services:
     volumes:
       - .:/app
     ports:
-      - "8000:8000"
+      # Maps local machine port 8001 to container port 8000
+      - "${HOST_WEB_PORT:-8001}:8000"
     environment:
-      - DATABASE_URL=postgresql://materialsuser:materials1234#$@db:5432/dealer_db
+      # Inside Docker network, 'web' must talk to container 'db:5432', so override localhost
+      - DATABASE_URL=postgresql+psycopg2://materialsuser:materials1234#$@db:5432/dealer_db
     depends_on:
       - db
 
