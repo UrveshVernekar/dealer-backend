@@ -2,12 +2,26 @@ from sqlalchemy.orm import Session
 from app.core.database import engine, SessionLocal, Base
 from app.models.user import User
 from app.models.scheme import Scheme
+from app.models.sales_data import SalesData
+from app.models.target_data import TargetData
 from app.core.security import hash_password
 
 def init_db():
     # Create all tables in the database
     Base.metadata.create_all(bind=engine)
     
+    # Add product_category column to sales_data if it does not exist
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text
+        db.execute(text("ALTER TABLE sales_data ADD COLUMN IF NOT EXISTS product_category VARCHAR(50)"))
+        db.commit()
+    except Exception as e:
+        print(f"Error migrating sales_data table: {e}")
+        db.rollback()
+    finally:
+        db.close()
+        
     db = SessionLocal()
     try:
         # Seed default admin user

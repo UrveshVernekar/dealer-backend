@@ -1,4 +1,5 @@
 import io
+import re
 import pandas as pd
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
@@ -6,6 +7,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.core.database import get_db, engine
 from app.models.user import User
+from app.models.sales_data import SalesData
+from app.models.target_data import TargetData
 from app.routers.auth import get_admin_user
 
 router = APIRouter(prefix="/import", tags=["Data Import"])
@@ -17,6 +20,187 @@ HEADER_INDICATORS = [
     "region", "state", "quantity", "basic rate", "net value", 
     "product mapping", "updated_channel", "material description"
 ]
+
+SALES_COLUMN_MAPPINGS = {
+    "billing_date": "bill_date",
+    "bill_date": "bill_date",
+    "billing_document_date": "bill_date",
+    "invoice_date": "bill_date",
+    
+    "plant": "plnt",
+    "plnt": "plnt",
+    
+    "branch": "branch",
+    "region": "branch",
+    
+    "item": "item",
+    "itm": "item",
+    "billing_item": "item",
+    
+    "sold_to_party": "sold_to_pt",
+    "sold_to_pt": "sold_to_pt",
+    "sold_to": "sold_to_pt",
+    
+    "ship_to_party_name": "ship_to_party_name",
+    "ship_to_name": "ship_to_party_name",
+    "ship_party_name": "ship_to_party_name",
+    
+    "ship_to": "ship_to",
+    "ship_to_party": "ship_to",
+    "ship_to_pt": "ship_to",
+    
+    "sold_to_party_name": "sold_party_name",
+    "sold_party_name": "sold_party_name",
+    "sold_name": "sold_party_name",
+    "dealer_name": "sold_party_name",
+    
+    "material_group": "mat_group",
+    "mat_group": "mat_group",
+    "mat_grp": "mat_group",
+    "matl_group": "mat_group",
+    "matl_grp": "mat_group",
+    
+    "material": "material",
+    "material_code": "material",
+    "material_id": "material",
+    "mat_code": "material",
+    
+    "material_description": "material_description",
+    "material_desc": "material_description",
+    "mat_description": "material_description",
+    
+    "billed_quantity": "inv_qty_bu",
+    "inv_qty_bu": "inv_qty_bu",
+    "quantity": "inv_qty_bu",
+    "qty": "inv_qty_bu",
+    "invoice_qty": "inv_qty_bu",
+    
+    "dealer_price": "dealer_pri",
+    "dealer_pri": "dealer_pri",
+    "dealer_rate": "dealer_pri",
+    
+    "sale_price": "sale_price",
+    "selling_price": "sale_price",
+    "sales_price": "sale_price",
+    
+    "basic_rate": "basic_rate",
+    "basic_value": "basic_rate",
+    "basic_amount": "basic_rate",
+    
+    "discount_p": "discount_p",
+    "discount_percentage": "discount_p",
+    
+    "discount_w": "discount_w",
+    "discount_value": "discount_w",
+    
+    "dealer_commission": "dealer_com",
+    "dealer_com": "dealer_com",
+    "commission": "dealer_com",
+    
+    "free_goods": "free_goods",
+    "free_qty": "free_goods",
+    "free_items": "free_goods",
+    
+    "cash_discount_percent": "cash_disco",
+    "cash_disco_percent": "cash_disco",
+    "cash_discount_p": "cash_disco",
+    "cash_disco": "cash_disco",
+    
+    "total_scheme_discount": "tot_sch",
+    "tot_sch": "tot_sch",
+    "scheme_discount": "tot_sch",
+    "total_scheme": "tot_sch",
+    
+    "combo_offer": "combo_offe",
+    "combo_offe": "combo_offe",
+    "combo": "combo_offe",
+    
+    "special_discount": "special",
+    "special": "special",
+    "special_off": "special",
+    
+    "adjusted_dealer_price": "adjusted_d",
+    "adjusted_d": "adjusted_d",
+    "adjusted_dealer": "adjusted_d",
+    "adj_dealer_price": "adjusted_d",
+    
+    "cash_discount": "cash_disc",
+    "cash_disc": "cash_disc",
+    "cash_discount_amount": "cash_disc",
+    
+    "net_value": "netvalue",
+    "netvalue": "netvalue",
+    "net_amount": "netvalue",
+    
+    "tax_amount": "tax_amount",
+    "tax_value": "tax_amount",
+    "tax": "tax_amount",
+    
+    "gross_value": "gross_val",
+    "gross_val": "gross_val",
+    "gross_amount": "gross_val",
+    
+    "cgst_rate": "cgst_rate",
+    "cgst_percentage": "cgst_rate",
+    
+    "cgst_amount": "central_gs",
+    "central_gs": "central_gs",
+    "central_gst": "central_gs",
+    "cgst": "central_gs",
+    
+    "sgst_rate": "sgst_rate",
+    "sgst_percentage": "sgst_rate",
+    
+    "sgst_amount": "state_gst",
+    "state_gst": "state_gst",
+    "state_gst_amount": "state_gst",
+    "sgst": "state_gst",
+    
+    "igst_amount": "integrated",
+    "integrated_gst": "integrated",
+    "integrated": "integrated",
+    "igst": "integrated",
+    
+    "igst_rate": "igst_rate",
+    "igst_percentage": "igst_rate",
+    
+    "ugst_amount": "union_ter",
+    "union_territory_gst": "union_ter",
+    "union_ter": "union_ter",
+    "ugst": "union_ter",
+    
+    "ugst_rate": "ugst_rate",
+    "ugst_percentage": "ugst_rate"
+}
+
+TARGET_COLUMN_MAPPINGS = {
+    "region": "region",
+    "state": "state",
+    
+    "channel_code": "channel_code",
+    "new_channel": "new_channel",
+    
+    "sold_to_code": "sold_to_code",
+    "sold_to_pt": "sold_to_code",
+    "sold_to": "sold_to_code",
+    
+    "new_sold_to_party": "new_sold_to_party",
+    "new_sold_to_pt": "new_sold_to_party",
+    "new_sold_to": "new_sold_to_party",
+    
+    "dealer_name": "dealer_name",
+    "dealer": "dealer_name",
+    
+    "product": "product",
+    "product_raw": "product_raw",
+    
+    "q1": "q1",
+    "q2": "q2",
+    "q3": "q3",
+    "q4": "q4",
+    "total": "total",
+    "remarks": "remarks"
+}
 
 def find_header_row_index(df_raw):
     best_row_idx = 0
@@ -47,11 +231,12 @@ def find_header_row_index(df_raw):
 def sanitize_column_names(columns):
     clean_cols = []
     for col in columns:
-        # Convert to string, lowercase, replace spaces/dashes with underscores
+        # Convert to string, lowercase
         c = str(col).strip().lower()
-        c = c.replace(" ", "_").replace("-", "_").replace(".", "_").replace("/", "_").replace("=", "").replace("*", "")
-        # Remove extra special characters
-        c = "".join([char for char in c if char.isalnum() or char == "_"])
+        # Replace non-alphanumeric character sequences with a single underscore
+        c = re.sub(r'[^a-z0-9]+', '_', c)
+        # Strip leading/trailing underscores
+        c = c.strip('_')
         if not c or c == "unnamed":
             c = "unnamed_col"
         elif c[0].isdigit():
@@ -74,8 +259,9 @@ def sanitize_column_names(columns):
 @router.post("/upload")
 async def upload_excel_data(
     file: UploadFile = File(...),
-    year: int = Form(...),
-    quarter: str = Form(...),
+    year: int = Form(None),
+    quarter: str = Form(None),
+    month: str = Form(None),
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
 ):
@@ -148,22 +334,109 @@ async def upload_excel_data(
             # Sanitize column names
             df_data.columns = sanitize_column_names(df_data.columns)
             
-            # If the sheet is sale-report, append selected year and quarter
+            # If the sheet is sale-report, append selected year and quarter/month
             # We map the sheet name to a valid database table name
             db_table_name = sheet.lower().replace("-", "_").replace(" ", "_")
+            if "sales" in db_table_name and "data" in db_table_name:
+                db_table_name = "sales_data"
+            elif "target" in db_table_name and "data" in db_table_name:
+                db_table_name = "target_data"
             
-            if db_table_name == "sale_report":
+            if db_table_name == "sale_report" and year is not None:
                 df_data["selected_year"] = year
-                df_data["selected_quarter"] = quarter
-                
+                if quarter is not None:
+                    df_data["selected_quarter"] = quarter
+                if month is not None:
+                    df_data["selected_month"] = month
+            
+            print(db_table_name)
             # Save the dataframe to the database using SQLAlchemy connection
-            # We replace the table dynamically
-            df_data.to_sql(
-                name=db_table_name,
-                con=engine,
-                if_exists="replace",
-                index=False
-            )
+            if db_table_name == "sales_data":
+                # Rename columns using SALES_COLUMN_MAPPINGS to align alternative column names
+                df_data = df_data.rename(columns=SALES_COLUMN_MAPPINGS)
+                # Keep only the first occurrence of each column name (avoids duplicates from mapping)
+                df_data = df_data.loc[:, ~df_data.columns.duplicated()]
+                
+                # Ensure bill_date is parsed as datetime to extract month/year
+                if "bill_date" in df_data.columns:
+                    df_data["bill_date"] = pd.to_datetime(df_data["bill_date"], dayfirst=True, errors="coerce")
+                    # Extract year and month (full month name)
+                    df_data["year"] = df_data["bill_date"].dt.year
+                    df_data["month"] = df_data["bill_date"].dt.strftime("%B")
+                
+                # Derive product_category from mat_group
+                if "mat_group" in df_data.columns:
+                    def map_mat_group(val):
+                        if pd.isna(val):
+                            return None
+                        val_str = str(val).strip()
+                        val_upper = val_str.upper()
+                        if val_upper in ["FLT", "FLU", "WD"]:
+                            return "FL"
+                        elif val_upper in ["AC", "ACMIU", "ACMOU"]:
+                            return "AC"
+                        elif val_upper in ["MW"]:
+                            return "MWO"
+                        elif val_upper in ["REFDC", "REFFF"]:
+                            return "REF"
+                        elif val_upper in ["TL", "TLM"]:
+                            return "TL"
+                        return val_str
+                    df_data["product_category"] = df_data["mat_group"].apply(map_mat_group)
+                
+                # Fetch only valid columns from model schema
+                allowed_cols = [c.name for c in SalesData.__table__.columns if c.name != "id"]
+                # Keep only columns that exist in the database table schema
+                df_data = df_data[[col for col in df_data.columns if col in allowed_cols]]
+                
+                # Delete existing rows matching the uploaded billing dates to simulate replacement
+                if "bill_date" in df_data.columns:
+                    unique_dates = df_data["bill_date"].dropna().unique()
+                    date_list = [pd.to_datetime(d).date() for d in unique_dates]
+                    if date_list:
+                        db.execute(
+                            text("DELETE FROM sales_data WHERE bill_date = ANY(CAST(:dates AS date[]))"),
+                            {"dates": date_list}
+                        )
+                        db.commit()
+                
+                # Save to database using append to retain predefined table structure
+                df_data.to_sql(
+                    name=db_table_name,
+                    con=engine,
+                    if_exists="append",
+                    index=False
+                )
+            elif db_table_name == "target_data":
+                # Rename columns using TARGET_COLUMN_MAPPINGS to align alternative column names
+                df_data = df_data.rename(columns=TARGET_COLUMN_MAPPINGS)
+                # Keep only the first occurrence of each column name (avoids duplicates from mapping)
+                df_data = df_data.loc[:, ~df_data.columns.duplicated()]
+                
+                # Fetch only valid columns from model schema
+                allowed_cols = [c.name for c in TargetData.__table__.columns if c.name != "id"]
+                # Keep only columns that exist in the database table schema
+                df_data = df_data[[col for col in df_data.columns if col in allowed_cols]]
+                
+                # Delete existing target data to simulate "replace"
+                db.execute(text("DELETE FROM target_data"))
+                db.commit()
+                
+                # Save to database using append to retain predefined table structure
+                df_data.to_sql(
+                    name=db_table_name,
+                    con=engine,
+                    if_exists="append",
+                    index=False
+                )
+            else:
+                # We replace the table dynamically
+                df_data.to_sql(
+                    name=db_table_name,
+                    con=engine,
+                    if_exists="replace",
+                    index=False
+                )
             
             results[sheet] = {
                 "table_name": db_table_name,
@@ -188,7 +461,7 @@ async def upload_excel_data(
 
 from fastapi.responses import StreamingResponse
 
-ALLOWED_TABLES = {"new_scheme", "dealer_sku", "target_compilation", "dealer_product", "sale_report"}
+ALLOWED_TABLES = {"new_scheme", "dealer_sku", "target_compilation", "dealer_product", "sale_report", "sales_data", "target_data"}
 
 @router.get("/tables")
 def get_imported_tables(
