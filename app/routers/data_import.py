@@ -79,27 +79,51 @@ async def upload_excel_data(
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
 ):
-    if not file.filename.endswith(('.xlsx', '.xls')):
+
+    print("Inside the function upload ........")    
+    filename = file.filename.lower()
+    
+    if not filename.endswith(('.xlsx', '.xls', '.xlsb')):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only Excel (.xlsx, .xls) files are allowed."
+            detail="Only Excel (.xlsx, .xls, .xlsb) files are allowed."
         )
         
     try:
+        
+        # 1. Determine the correct engine dynamically
+        reader_engine = None
+        if filename.endswith(".xlsb"):
+            reader_engine = "pyxlsb"
+        elif filename.endswith(".xlsx"):
+            reader_engine = "openpyxl"
+        elif filename.endswith(".xls"):
+            reader_engine = "xlrd"
         # Read the file content
         content = await file.read()
-        excel_file = pd.ExcelFile(io.BytesIO(content))
+        
+        file_stream = io.BytesIO(content)
+        file_stream.seek(0)
+        
+        # 2. Pass the engine to ExcelFile so it knows how to parse sheet names
+        excel_file = pd.ExcelFile(file_stream, engine=reader_engine)
         sheet_names = excel_file.sheet_names
         
         results = {}
         
         for sheet in sheet_names:
-            # Read sheet without headers to inspect raw rows
-            df_raw = pd.read_excel(io.BytesIO(content), sheet_name=sheet, header=None)
+            # Re-seek or pass the BytesIO object directly with the engine
+            file_stream.seek(0)
+            df_raw = pd.read_excel(
+                file_stream, 
+                sheet_name=sheet,
+                engine=reader_engine, 
+                header=None
+            )
             
             if df_raw.empty:
                 continue
-                
+                            
             # Find the header row index
             header_idx = find_header_row_index(df_raw)
             
