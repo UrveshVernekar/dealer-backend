@@ -57,6 +57,8 @@ SALES_COLUMN_MAPPINGS = {
     "material_group": "mat_group",
     "mat_group": "mat_group",
     "mat_grp": "mat_group",
+    "matl_group": "mat_group",
+    "matl_grp": "mat_group",
     
     "material": "material",
     "material_code": "material",
@@ -361,6 +363,26 @@ async def upload_excel_data(
                     # Extract year and month (full month name)
                     df_data["year"] = df_data["bill_date"].dt.year
                     df_data["month"] = df_data["bill_date"].dt.strftime("%B")
+                
+                # Derive product_category from mat_group
+                if "mat_group" in df_data.columns:
+                    def map_mat_group(val):
+                        if pd.isna(val):
+                            return None
+                        val_str = str(val).strip()
+                        val_upper = val_str.upper()
+                        if val_upper in ["FLT", "FLU", "WD"]:
+                            return "FL"
+                        elif val_upper in ["AC", "ACMIU", "ACMOU"]:
+                            return "AC"
+                        elif val_upper in ["MW"]:
+                            return "MWO"
+                        elif val_upper in ["REFDC", "REFFF"]:
+                            return "REF"
+                        elif val_upper in ["TL", "TLM"]:
+                            return "TL"
+                        return val_str
+                    df_data["product_category"] = df_data["mat_group"].apply(map_mat_group)
                 
                 # Fetch only valid columns from model schema
                 allowed_cols = [c.name for c in SalesData.__table__.columns if c.name != "id"]
