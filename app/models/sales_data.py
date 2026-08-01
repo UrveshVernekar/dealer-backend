@@ -1,0 +1,48 @@
+from sqlalchemy import Column, Integer, String, Float, Date
+from app.core.database import Base
+
+class SalesData(Base):
+    __tablename__ = "sales_data"
+
+    id = Column(Integer, primary_key=True, index=True)
+    bill_date = Column(Date, nullable=True)
+    plnt = Column(String(50), nullable=True)
+    branch = Column(String(100), nullable=True)
+    item = Column(Integer, nullable=True)
+    sold_to_pt = Column(String(50), nullable=True)
+    ship_to_party_name = Column(String(255), nullable=True)
+    ship_to = Column(String(50), nullable=True)
+    sold_party_name = Column(String(255), nullable=True)
+    mat_group = Column(String(50), nullable=True)
+    material = Column(String(50), nullable=True)
+    material_description = Column(String(255), nullable=True)
+    inv_qty_bu = Column(Integer, nullable=True)
+    dealer_pri = Column(Float, nullable=True)
+    sale_price = Column(Float, nullable=True)
+    basic_rate = Column(Float, nullable=True)
+    discount_p = Column(Float, nullable=True)
+    discount_w = Column(Float, nullable=True)
+    dealer_com = Column(Float, nullable=True)
+    free_goods = Column(Float, nullable=True)
+    cash_disco = Column(Float, nullable=True)
+    tot_sch = Column(Float, nullable=True)
+    combo_offe = Column(Float, nullable=True)
+    special = Column(Float, nullable=True)
+    adjusted_d = Column(Float, nullable=True)
+    cash_disc = Column(Float, nullable=True)
+    netvalue = Column(Float, nullable=True)
+    tax_amount = Column(Float, nullable=True)
+    gross_val = Column(Float, nullable=True)
+    cgst_rate = Column(Float, nullable=True)
+    central_gs = Column(Float, nullable=True)
+    sgst_rate = Column(Float, nullable=True)
+    state_gst = Column(Float, nullable=True)
+    integrated = Column(Float, nullable=True)
+    igst_rate = Column(Float, nullable=True)
+    union_ter = Column(Float, nullable=True)
+    ugst_rate = Column(Float, nullable=True)
+    
+    # Derived fields
+    month = Column(String(50), nullable=True)
+    year = Column(Integer, nullable=True)
+    product_category = Column(String(50), nullable=True)
