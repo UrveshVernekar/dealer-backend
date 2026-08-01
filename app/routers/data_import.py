@@ -74,6 +74,7 @@ SALES_COLUMN_MAPPINGS = {
     "quantity": "inv_qty_bu",
     "qty": "inv_qty_bu",
     "invoice_qty": "inv_qty_bu",
+    "inv_qty": "inv_qty_bu",
     
     "dealer_price": "dealer_pri",
     "dealer_pri": "dealer_pri",
