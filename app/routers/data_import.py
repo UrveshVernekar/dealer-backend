@@ -2,14 +2,16 @@ import io
 import re
 import pandas as pd
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.core.database import get_db, engine
+from datetime import datetime, timezone
 from app.models.user import User
 from app.models.sales_data import SalesData
 from app.models.target_data import TargetData
-from app.routers.auth import get_admin_user
+from app.models.import_mapping import ImportTableMapping
+from app.routers.auth import get_admin_user, get_current_user
 
 router = APIRouter(prefix="/import", tags=["Data Import"])
 
@@ -257,6 +259,34 @@ def sanitize_column_names(columns):
             
     return final_cols
 
+
+def normalize_sheet_name(sheet_name: str) -> str:
+    normalized = re.sub(r'[^a-z0-9]+', '_', str(sheet_name).strip().lower()).strip('_')
+    if not normalized:
+        return "sheet"
+    if "sales" in normalized and "data" in normalized:
+        return "sales_data"
+    if "target" in normalized and "data" in normalized:
+        return "target_data"
+    return normalized
+
+
+def persist_import_mapping(db: Session, sheet_name: str, table_name: str):
+    mapping = db.query(ImportTableMapping).filter(
+        ImportTableMapping.original_sheet_name == sheet_name
+    ).first()
+    if mapping is None:
+        mapping = ImportTableMapping(
+            original_sheet_name=sheet_name,
+            normalized_table_name=table_name,
+        )
+        db.add(mapping)
+    else:
+        mapping.normalized_table_name = table_name
+        mapping.imported_at = datetime.now(timezone.utc)
+    db.commit()
+
+
 @router.post("/upload")
 async def upload_excel_data(
     file: UploadFile = File(...),
@@ -337,11 +367,7 @@ async def upload_excel_data(
             
             # If the sheet is sale-report, append selected year and quarter/month
             # We map the sheet name to a valid database table name
-            db_table_name = sheet.lower().replace("-", "_").replace(" ", "_")
-            if "sales" in db_table_name and "data" in db_table_name:
-                db_table_name = "sales_data"
-            elif "target" in db_table_name and "data" in db_table_name:
-                db_table_name = "target_data"
+            db_table_name = normalize_sheet_name(sheet)
             
             if db_table_name == "sale_report" and year is not None:
                 df_data["selected_year"] = year
@@ -351,6 +377,7 @@ async def upload_excel_data(
                     df_data["selected_month"] = month
             
             print(db_table_name)
+            persist_import_mapping(db, sheet, db_table_name)
             # Save the dataframe to the database using SQLAlchemy connection
             if db_table_name == "sales_data":
                 # Rename columns using SALES_COLUMN_MAPPINGS to align alternative column names
@@ -462,21 +489,25 @@ async def upload_excel_data(
 
 from fastapi.responses import StreamingResponse
 
-ALLOWED_TABLES = {"new_scheme", "dealer_sku", "target_compilation", "dealer_product", "sale_report", "sales_data", "target_data"}
+def get_user_tables(db: Session):
+    result = db.execute(text("""
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+          AND table_type = 'BASE TABLE'
+          AND table_name NOT LIKE 'pg_%'
+          AND table_name NOT LIKE 'sql_%'
+        ORDER BY table_name
+    """))
+    return [row[0] for row in result.fetchall()]
+
 
 @router.get("/tables")
 def get_imported_tables(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_admin_user)
 ):
-    existing_tables = []
-    for table in ALLOWED_TABLES:
-        result = db.execute(text(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :t)"
-        ), {"t": table}).scalar()
-        if result:
-            existing_tables.append(table)
-    return {"tables": sorted(existing_tables)}
+    return {"tables": sorted(get_user_tables(db))}
 
 @router.get("/tables/{table_name}")
 def get_table_data(
@@ -484,13 +515,8 @@ def get_table_data(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_admin_user)
 ):
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=400, detail="Invalid table name")
-        
-    table_exists = db.execute(text(
-        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :t)"
-    ), {"t": table_name}).scalar()
-    if not table_exists:
+    available_tables = set(get_user_tables(db))
+    if table_name not in available_tables:
         raise HTTPException(status_code=404, detail=f"Table {table_name} does not exist yet. Please upload data first.")
         
     result = db.execute(text(f"SELECT * FROM {table_name}"))
@@ -509,13 +535,8 @@ def download_table(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_admin_user)
 ):
-    if table_name not in ALLOWED_TABLES:
-        raise HTTPException(status_code=400, detail="Invalid table name")
-        
-    table_exists = db.execute(text(
-        "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :t)"
-    ), {"t": table_name}).scalar()
-    if not table_exists:
+    available_tables = set(get_user_tables(db))
+    if table_name not in available_tables:
         raise HTTPException(status_code=404, detail=f"Table {table_name} does not exist yet. Please upload data first.")
         
     df = pd.read_sql_query(f"SELECT * FROM {table_name}", con=engine)
@@ -542,19 +563,46 @@ def get_column(df, candidates, default=0):
     return pd.Series(default, index=df.index)
 
 
+def resolve_required_table(db: Session, required_name: str):
+    available_tables = set(get_user_tables(db))
+    if required_name in available_tables:
+        return required_name
+
+    expected_name = normalize_sheet_name(required_name)
+    mapping_rows = db.query(ImportTableMapping).all()
+    for row in mapping_rows:
+        if normalize_sheet_name(row.original_sheet_name) == expected_name and row.normalized_table_name in available_tables:
+            return row.normalized_table_name
+
+    return None
+
+
 def run_outcome_calculation(db: Session):
-    for t in ["new_scheme", "dealer_sku"]:
-        exists = db.execute(text(
-            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = 'public' AND table_name = :t)"
-        ), {"t": t}).scalar()
-        if not exists:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Required table '{t}' does not exist yet. Please upload dealer data Excel sheets first."
+    available_tables = set(get_user_tables(db))
+    required_tables = ["new_scheme", "dealer_sku"]
+    resolved_tables = {}
+    missing_tables = []
+
+    print("Available tables:", available_tables)
+    for table_name in required_tables:
+        resolved_name = resolve_required_table(db, table_name)
+        if resolved_name:
+            resolved_tables[table_name] = resolved_name
+        else:
+            missing_tables.append(table_name)
+
+    if missing_tables:
+        available_list = ", ".join(sorted(available_tables)) if available_tables else "none"
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Required table(s) {', '.join(missing_tables)} do not exist yet. "
+                f"Available user tables: {available_list}"
             )
+        )
             
-    df1 = pd.read_sql_query("SELECT * FROM dealer_sku", con=engine)
-    df2 = pd.read_sql_query("SELECT * FROM new_scheme", con=engine)
+    df1 = pd.read_sql_query(f"SELECT * FROM {resolved_tables['dealer_sku']}", con=engine)
+    df2 = pd.read_sql_query(f"SELECT * FROM {resolved_tables['new_scheme']}", con=engine)
     
     target_states = [
         "tamilnadu", "tamil nadu", "kerela", "kerala", "westbengal", "west bengal", 
@@ -642,10 +690,104 @@ def run_outcome_calculation(db: Session):
     return export_df, total_old, total_new, delta
 
 
+def run_sales_outcome_calculation(db: Session, year: int = 2025):
+    available_tables = set(get_user_tables(db))
+    required_tables = ["sales_data", "target_data"]
+    missing_tables = [table for table in required_tables if table not in available_tables]
+
+    if missing_tables:
+        available_list = ", ".join(sorted(available_tables)) if available_tables else "none"
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                f"Required table(s) {', '.join(missing_tables)} do not exist yet. "
+                f"Available user tables: {available_list}"
+            )
+        )
+
+    sql = """
+    WITH sales AS (
+        SELECT
+            sd.year,
+            sd.month,
+            sd.product_category,
+            sd.sold_to_pt,
+            SUM(sd.inv_qty_bu) AS month_sales,
+
+            CASE
+                WHEN sd.month IN ('April','May','June') THEN 'Q1'
+                WHEN sd.month IN ('July','August','September') THEN 'Q2'
+                WHEN sd.month IN ('October','November','December') THEN 'Q3'
+                WHEN sd.month IN ('January','February','March') THEN 'Q4'
+            END AS quarter,
+
+            CASE
+                WHEN sd.month IN ('April','May','June') THEN td.q1
+                WHEN sd.month IN ('July','August','September') THEN td.q2
+                WHEN sd.month IN ('October','November','December') THEN td.q3
+                WHEN sd.month IN ('January','February','March') THEN td.q4
+            END AS quarter_target
+
+        FROM public.sales_data sd
+        JOIN public.target_data td
+          ON sd.sold_to_pt = td.sold_to_code
+         AND sd.product_category = td.product
+
+        WHERE sd.year = :year
+
+        GROUP BY
+            sd.year,
+            sd.month,
+            sd.product_category,
+            sd.sold_to_pt,
+            td.q1, td.q2, td.q3, td.q4
+    )
+
+    SELECT
+        sold_to_pt,
+        year,
+        month,
+        product_category,
+        month_sales,
+        quarter_target,
+
+        month_sales / SUM(month_sales) OVER (
+            PARTITION BY sold_to_pt, year, product_category, quarter
+        ) AS fraction_of_quarter,
+
+        quarter_target * (
+            month_sales / SUM(month_sales) OVER (
+                PARTITION BY sold_to_pt, year, product_category, quarter
+            )
+        ) AS monthly_target
+
+    FROM sales
+    ORDER BY year, quarter, month;
+    """
+
+    export_df = pd.read_sql_query(text(sql), con=engine, params={"year": year})
+    if export_df.empty:
+        export_df = pd.DataFrame(columns=[
+            "sold_to_pt",
+            "year",
+            "month",
+            "product_category",
+            "month_sales",
+            "quarter_target",
+            "fraction_of_quarter",
+            "monthly_target",
+        ])
+
+    total_old = float(export_df["month_sales"].sum()) if "month_sales" in export_df.columns else 0.0
+    total_new = float(export_df["monthly_target"].sum()) if "monthly_target" in export_df.columns else 0.0
+    delta = total_old - total_new
+    return export_df, total_old, total_new, delta
+
+
 @router.get("/outcome")
 def get_scheme_outcome(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_admin_user)
+    current_user: User = Depends(get_current_user)
 ):
     try:
         export_df, total_old, total_new, delta = run_outcome_calculation(db)
@@ -681,7 +823,7 @@ def get_scheme_outcome(
 @router.get("/outcome/download")
 def download_scheme_outcome(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_admin_user)
+    current_user: User = Depends(get_current_user)
 ):
     try:
         export_df, total_old, total_new, delta = run_outcome_calculation(db)
@@ -730,4 +872,95 @@ def download_scheme_outcome(
             detail=f"Failed to generate spreadsheet download: {str(e)}"
         )
 
+
+@router.get("/sales-outcome")
+def get_sales_outcome(
+    year: int = Query(2025, description="Year for sales outcome calculation"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    print(f"Inside the function get_sales_outcome for year {year}........")
+    try:
+        export_df, total_old, total_new, delta = run_sales_outcome_calculation(db, year=year)
+        columns = list(export_df.columns)
+        rows = export_df.to_dict(orient="records")
+        
+        # Format nan values to None/null for JSON standard compliance
+        for row in rows:
+            for k, v in row.items():
+                if isinstance(v, float) and np.isnan(v):
+                    row[k] = None
+                    
+        return {
+            "columns": columns,
+            "rows": rows,
+            "summary": {
+                "total_old": total_old,
+                "total_new": total_new,
+                "delta": delta
+            }
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred during outcome generation: {str(e)}"
+        )
+
+
+@router.get("/sales-outcome/download")
+def download_sales_outcome(
+    year: int = Query(2025, description="Year for sales outcome calculation"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    print(f"Inside the function download_sales_outcome for year {year}........")
+    try:
+        export_df, total_old, total_new, delta = run_sales_outcome_calculation(db, year=year)
+        
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            export_df.to_excel(writer, sheet_name="Sales_Outcome", index=False)
+            
+            start_row = len(export_df) + 2
+            try:
+                start_col = list(export_df.columns).index("month_sales")
+            except ValueError:
+                start_col = max(0, len(export_df.columns) - 4)
+                
+            summary_df = pd.DataFrame({
+                "Metric": ["Grand Total"],
+                "Old_discount": [total_old],
+                "New_discount": [total_new],
+                "Delta": [delta]
+            })
+            
+            summary_df.to_excel(
+                writer,
+                sheet_name="Sales_Outcome",
+                startrow=start_row,
+                startcol=start_col,
+                index=False
+            )
+            
+        buffer.seek(0)
+        
+        headers = {
+            'Content-Disposition': 'attachment; filename="sales-outcome.xlsx"'
+        }
+        return StreamingResponse(
+            buffer,
+            headers=headers,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate spreadsheet download: {str(e)}"
+        )
 

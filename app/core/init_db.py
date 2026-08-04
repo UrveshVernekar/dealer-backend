@@ -4,12 +4,21 @@ from app.models.user import User
 from app.models.scheme import Scheme
 from app.models.sales_data import SalesData
 from app.models.target_data import TargetData
+from app.models.import_mapping import ImportTableMapping
 from app.core.security import hash_password
 
 def init_db():
-    # Create all tables in the database
-    Base.metadata.create_all(bind=engine)
-    
+    if engine is None or SessionLocal is None:
+        print("Database engine is not available; skipping initialization.")
+        return
+
+    try:
+        # Create all tables in the database
+        Base.metadata.create_all(bind=engine)
+    except Exception as e:
+        print(f"Error creating database tables: {e}")
+        return
+
     # Add product_category column to sales_data if it does not exist
     db = SessionLocal()
     try:
@@ -21,7 +30,7 @@ def init_db():
         db.rollback()
     finally:
         db.close()
-        
+
     db = SessionLocal()
     try:
         # Seed default admin user
