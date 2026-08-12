@@ -690,7 +690,18 @@ def run_outcome_calculation(db: Session):
     return export_df, total_old, total_new, delta
 
 
-def run_sales_outcome_calculation(db: Session, year: int = 2025):
+MONTH_NAME_TO_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+}
+
+def run_sales_outcome_calculation(
+    db: Session,
+    year: Optional[int] = None,
+    duration: str = "all",
+    start_period: Optional[str] = None,
+    end_period: Optional[str] = None
+):
     available_tables = set(get_user_tables(db))
     required_tables = ["sales_data", "target_data"]
     missing_tables = [table for table in required_tables if table not in available_tables]
@@ -733,8 +744,6 @@ def run_sales_outcome_calculation(db: Session, year: int = 2025):
           ON sd.sold_to_pt = td.sold_to_code
          AND sd.product_category = td.product
 
-        WHERE sd.year = :year
-
         GROUP BY
             sd.year,
             sd.month,
@@ -765,7 +774,7 @@ def run_sales_outcome_calculation(db: Session, year: int = 2025):
     ORDER BY year, quarter, month;
     """
 
-    export_df = pd.read_sql_query(text(sql), con=engine, params={"year": year})
+    export_df = pd.read_sql_query(text(sql), con=engine)
     if export_df.empty:
         export_df = pd.DataFrame(columns=[
             "sold_to_pt",
@@ -777,11 +786,71 @@ def run_sales_outcome_calculation(db: Session, year: int = 2025):
             "fraction_of_quarter",
             "monthly_target",
         ])
+        return export_df, 0.0, 0.0, 0.0
 
-    total_old = float(export_df["month_sales"].sum()) if "month_sales" in export_df.columns else 0.0
-    total_new = float(export_df["monthly_target"].sum()) if "monthly_target" in export_df.columns else 0.0
+    # Calculate month numbers and period keys
+    export_df["month_num"] = export_df["month"].str.strip().str.lower().map(MONTH_NAME_TO_NUM).fillna(1).astype(int)
+    export_df["period_key"] = export_df["year"] * 12 + export_df["month_num"]
+
+    # 1. Determine unique periods from calculated outcomes to establish boundaries
+    periods_list = export_df[["year", "month_num"]].drop_duplicates().values.tolist()
+    if periods_list:
+        periods_list.sort(key=lambda x: x[0] * 12 + x[1])
+        min_db_period = periods_list[0][0] * 12 + periods_list[0][1]
+        max_db_period = periods_list[-1][0] * 12 + periods_list[-1][1]
+    else:
+        min_db_period = 2025 * 12 + 1
+        max_db_period = 2025 * 12 + 12
+
+    # Handle legacy year parameter
+    if year is not None and duration == "all" and not start_period and not end_period:
+        duration = "custom"
+        start_period = f"{year}-01"
+        end_period = f"{year}-12"
+
+    # Calculate active range boundaries
+    if duration == "all":
+        min_period_key = min_db_period
+        max_period_key = max_db_period
+    elif duration == "custom":
+        min_period_key = min_db_period
+        max_period_key = max_db_period
+        if start_period:
+            try:
+                sy, sm = map(int, start_period.split("-"))
+                min_period_key = sy * 12 + sm
+            except ValueError:
+                pass
+        if end_period:
+            try:
+                ey, em = map(int, end_period.split("-"))
+                max_period_key = ey * 12 + em
+            except ValueError:
+                pass
+    else:
+        months_back = 3
+        if duration == "1m":
+            months_back = 1
+        elif duration == "6m":
+            months_back = 6
+        elif duration == "12m":
+            months_back = 12
+        max_period_key = max_db_period
+        min_period_key = max_period_key - months_back + 1
+
+    # Filter in Python
+    filtered_df = export_df[
+        (export_df["period_key"] >= min_period_key) &
+        (export_df["period_key"] <= max_period_key)
+    ].copy()
+
+    # Drop intermediate filtering columns
+    filtered_df.drop(columns=["month_num", "period_key"], inplace=True, errors="ignore")
+
+    total_old = float(filtered_df["month_sales"].sum()) if "month_sales" in filtered_df.columns else 0.0
+    total_new = float(filtered_df["monthly_target"].sum()) if "monthly_target" in filtered_df.columns else 0.0
     delta = total_old - total_new
-    return export_df, total_old, total_new, delta
+    return filtered_df, total_old, total_new, delta
 
 
 @router.get("/outcome")
@@ -875,13 +944,18 @@ def download_scheme_outcome(
 
 @router.get("/sales-outcome")
 def get_sales_outcome(
-    year: int = Query(2025, description="Year for sales outcome calculation"),
+    year: Optional[int] = Query(None, description="Year for sales outcome calculation"),
+    duration: str = Query("all", description="Duration filter: all, 1m, 3m, 6m, 12m, custom"),
+    start_period: Optional[str] = Query(None, description="Start period: YYYY-MM"),
+    end_period: Optional[str] = Query(None, description="End period: YYYY-MM"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    print(f"Inside the function get_sales_outcome for year {year}........")
+    print(f"Inside the function get_sales_outcome with duration {duration}........")
     try:
-        export_df, total_old, total_new, delta = run_sales_outcome_calculation(db, year=year)
+        export_df, total_old, total_new, delta = run_sales_outcome_calculation(
+            db, year=year, duration=duration, start_period=start_period, end_period=end_period
+        )
         columns = list(export_df.columns)
         rows = export_df.to_dict(orient="records")
         
@@ -891,6 +965,25 @@ def get_sales_outcome(
                 if isinstance(v, float) and np.isnan(v):
                     row[k] = None
                     
+        # Fetch distinct periods in database to return to UI
+        res = db.execute(text("SELECT DISTINCT year, month FROM sales_data WHERE year IS NOT NULL AND month IS NOT NULL")).fetchall()
+        periods_list = []
+        for r in res:
+            m_lower = r[1].strip().lower() if r[1] else ""
+            m_num = MONTH_NAME_TO_NUM.get(m_lower, 1)
+            periods_list.append((int(r[0]), m_num))
+            
+        distinct_periods_list = []
+        months_abbr = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        for yr, m_num in sorted(periods_list, key=lambda x: x[0]*12 + x[1], reverse=True):
+            m_label = months_abbr[m_num - 1]
+            distinct_periods_list.append({
+                "year": yr,
+                "month": m_num,
+                "label": f"{m_label} {yr}",
+                "value": f"{yr}-{m_num:02d}"
+            })
+                    
         return {
             "columns": columns,
             "rows": rows,
@@ -898,7 +991,8 @@ def get_sales_outcome(
                 "total_old": total_old,
                 "total_new": total_new,
                 "delta": delta
-            }
+            },
+            "periods": distinct_periods_list
         }
     except HTTPException as he:
         raise he
@@ -913,13 +1007,18 @@ def get_sales_outcome(
 
 @router.get("/sales-outcome/download")
 def download_sales_outcome(
-    year: int = Query(2025, description="Year for sales outcome calculation"),
+    year: Optional[int] = Query(None, description="Year for sales outcome calculation"),
+    duration: str = Query("all", description="Duration filter: all, 1m, 3m, 6m, 12m, custom"),
+    start_period: Optional[str] = Query(None, description="Start period: YYYY-MM"),
+    end_period: Optional[str] = Query(None, description="End period: YYYY-MM"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    print(f"Inside the function download_sales_outcome for year {year}........")
+    print(f"Inside the function download_sales_outcome with duration {duration}........")
     try:
-        export_df, total_old, total_new, delta = run_sales_outcome_calculation(db, year=year)
+        export_df, total_old, total_new, delta = run_sales_outcome_calculation(
+            db, year=year, duration=duration, start_period=start_period, end_period=end_period
+        )
         
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
