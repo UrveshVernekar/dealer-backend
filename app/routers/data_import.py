@@ -1,3 +1,4 @@
+from typing import Optional
 import io
 import re
 import pandas as pd
@@ -12,6 +13,7 @@ from app.models.sales_data import SalesData
 from app.models.target_data import TargetData
 from app.models.import_mapping import ImportTableMapping
 from app.routers.auth import get_admin_user, get_current_user
+from fastapi.responses import StreamingResponse
 
 router = APIRouter(prefix="/import", tags=["Data Import"])
 
@@ -77,6 +79,8 @@ SALES_COLUMN_MAPPINGS = {
     "qty": "inv_qty_bu",
     "invoice_qty": "inv_qty_bu",
     "inv_qty": "inv_qty_bu",
+    "invoiced_quantity": "inv_qty_bu",
+    "invoiced_qty": "inv_qty_bu",
     
     "dealer_price": "dealer_pri",
     "dealer_pri": "dealer_pri",
@@ -487,7 +491,7 @@ async def upload_excel_data(
         )
 
 
-from fastapi.responses import StreamingResponse
+
 
 def get_user_tables(db: Session):
     result = db.execute(text("""
@@ -690,18 +694,7 @@ def run_outcome_calculation(db: Session):
     return export_df, total_old, total_new, delta
 
 
-MONTH_NAME_TO_NUM = {
-    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-}
-
-def run_sales_outcome_calculation(
-    db: Session,
-    year: Optional[int] = None,
-    duration: str = "all",
-    start_period: Optional[str] = None,
-    end_period: Optional[str] = None
-):
+def run_sales_outcome_calculation(db: Session, year: Optional[int] = None):
     available_tables = set(get_user_tables(db))
     required_tables = ["sales_data", "target_data"]
     missing_tables = [table for table in required_tables if table not in available_tables]
@@ -716,14 +709,19 @@ def run_sales_outcome_calculation(
             )
         )
 
+    if year is None:
+        max_year = db.execute(text("SELECT MAX(year) FROM public.sales_data")).scalar()
+        year = int(max_year) if max_year is not None else datetime.now().year
+
     sql = """
-    WITH sales AS (
+    WITH raw_sales AS (
         SELECT
             sd.year,
             sd.month,
             sd.product_category,
             sd.sold_to_pt,
-            SUM(sd.inv_qty_bu) AS month_sales,
+            sd.sold_party_name,
+            COALESCE(SUM(sd.inv_qty_bu::numeric), 0) AS month_sales,
 
             CASE
                 WHEN sd.month IN ('April','May','June') THEN 'Q1'
@@ -740,38 +738,74 @@ def run_sales_outcome_calculation(
             END AS quarter_target
 
         FROM public.sales_data sd
-        JOIN public.target_data td
-          ON sd.sold_to_pt = td.sold_to_code
-         AND sd.product_category = td.product
+        LEFT JOIN public.target_data td
+        ON sd.sold_to_pt = td.sold_to_code
+        AND sd.product_category = td.product
+
+        -- Fetch both current year and last year
+        WHERE sd.year IN (:year, :year - 1)
 
         GROUP BY
             sd.year,
             sd.month,
             sd.product_category,
             sd.sold_to_pt,
+            sd.sold_party_name,
             td.q1, td.q2, td.q3, td.q4
+    ),
+
+    sales_with_fractions AS (
+        SELECT
+            year,
+            month,
+            product_category,
+            sold_to_pt,
+            sold_party_name,
+            quarter,
+            month_sales,
+            quarter_target,
+
+            -- Calculate each month's fraction of its quarterly sales for that specific year
+            COALESCE(
+                month_sales / NULLIF(
+                    SUM(month_sales) OVER (
+                        PARTITION BY sold_to_pt, product_category, year, quarter
+                    ), 0
+                ),
+                0
+            ) AS yearly_month_fraction
+
+        FROM raw_sales
     )
 
     SELECT
-        sold_to_pt,
-        year,
-        month,
-        product_category,
-        month_sales,
-        quarter_target,
+        curr.sold_to_pt,
+        curr.sold_party_name,
+        curr.year,
+        curr.month,
+        curr.product_category,
+        curr.month_sales,
+        curr.quarter_target,
 
-        month_sales / SUM(month_sales) OVER (
-            PARTITION BY sold_to_pt, year, product_category, quarter
-        ) AS fraction_of_quarter,
+        -- Fraction from the exact same month & quarter in (year - 1)
+        COALESCE(prev.yearly_month_fraction, 0) AS last_year_fraction_of_quarter,
 
-        quarter_target * (
-            month_sales / SUM(month_sales) OVER (
-                PARTITION BY sold_to_pt, year, product_category, quarter
-            )
-        ) AS monthly_target
+        -- Current quarter target multiplied by last year's monthly weight
+        
+        COALESCE(curr.quarter_target, 0) * COALESCE(prev.yearly_month_fraction, 0)
+        AS monthly_target
 
-    FROM sales
-    ORDER BY year, quarter, month;
+    FROM sales_with_fractions curr
+
+    -- Left join to pair current year records with last year's corresponding month
+    LEFT JOIN sales_with_fractions prev
+    ON curr.sold_to_pt = prev.sold_to_pt
+    AND curr.product_category = prev.product_category
+    AND curr.month = prev.month
+    AND prev.year = curr.year - 1
+
+    WHERE curr.year = :year
+    ORDER BY curr.year, curr.quarter, curr.month;
     """
 
     export_df = pd.read_sql_query(text(sql), con=engine)
@@ -944,10 +978,7 @@ def download_scheme_outcome(
 
 @router.get("/sales-outcome")
 def get_sales_outcome(
-    year: Optional[int] = Query(None, description="Year for sales outcome calculation"),
-    duration: str = Query("all", description="Duration filter: all, 1m, 3m, 6m, 12m, custom"),
-    start_period: Optional[str] = Query(None, description="Start period: YYYY-MM"),
-    end_period: Optional[str] = Query(None, description="End period: YYYY-MM"),
+    year: Optional[int] = Query(None, description="Year for sales outcome calculation. Defaults to latest available year if omitted."),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1007,10 +1038,7 @@ def get_sales_outcome(
 
 @router.get("/sales-outcome/download")
 def download_sales_outcome(
-    year: Optional[int] = Query(None, description="Year for sales outcome calculation"),
-    duration: str = Query("all", description="Duration filter: all, 1m, 3m, 6m, 12m, custom"),
-    start_period: Optional[str] = Query(None, description="Start period: YYYY-MM"),
-    end_period: Optional[str] = Query(None, description="End period: YYYY-MM"),
+    year: Optional[int] = Query(None, description="Year for sales outcome calculation. Defaults to latest available year if omitted."),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
