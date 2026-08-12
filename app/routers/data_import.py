@@ -693,8 +693,18 @@ def run_outcome_calculation(db: Session):
     delta = total_old - total_new
     return export_df, total_old, total_new, delta
 
+MONTH_NAME_TO_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+}
 
-def run_sales_outcome_calculation(db: Session, year: Optional[int] = None):
+def run_sales_outcome_calculation(
+    db: Session,
+    year: Optional[int] = None,
+    duration: str = "all",
+    start_period: Optional[str] = None,
+    end_period: Optional[str] = None
+):
     available_tables = set(get_user_tables(db))
     required_tables = ["sales_data", "target_data"]
     missing_tables = [table for table in required_tables if table not in available_tables]
@@ -709,9 +719,72 @@ def run_sales_outcome_calculation(db: Session, year: Optional[int] = None):
             )
         )
 
-    if year is None:
-        max_year = db.execute(text("SELECT MAX(year) FROM public.sales_data")).scalar()
-        year = int(max_year) if max_year is not None else datetime.now().year
+    # 1. Fetch unique periods in database to determine boundaries
+    res = db.execute(text("SELECT DISTINCT year, month FROM sales_data WHERE year IS NOT NULL AND month IS NOT NULL")).fetchall()
+    periods_list = []
+    for r in res:
+        m_lower = r[1].strip().lower() if r[1] else ""
+        m_num = MONTH_NAME_TO_NUM.get(m_lower, 1)
+        periods_list.append((int(r[0]), m_num))
+    
+    if periods_list:
+        periods_list.sort(key=lambda x: x[0] * 12 + x[1])
+        min_db_period = periods_list[0][0] * 12 + periods_list[0][1]
+        max_db_period = periods_list[-1][0] * 12 + periods_list[-1][1]
+    else:
+        min_db_period = 2025 * 12 + 1
+        max_db_period = 2025 * 12 + 12
+
+    # Handle legacy year parameter
+    if year is not None and duration == "all" and not start_period and not end_period:
+        duration = "custom"
+        start_period = f"{year}-01"
+        end_period = f"{year}-12"
+
+    # Calculate active range boundaries
+    if duration == "all":
+        min_period_key = min_db_period
+        max_period_key = max_db_period
+    elif duration == "custom":
+        min_period_key = min_db_period
+        max_period_key = max_db_period
+        if start_period:
+            try:
+                sy, sm = map(int, start_period.split("-"))
+                min_period_key = sy * 12 + sm
+            except ValueError:
+                pass
+        if end_period:
+            try:
+                ey, em = map(int, end_period.split("-"))
+                max_period_key = ey * 12 + em
+            except ValueError:
+                pass
+    else:
+        months_back = 3
+        if duration == "1m":
+            months_back = 1
+        elif duration == "6m":
+            months_back = 6
+        elif duration == "12m":
+            months_back = 12
+        max_period_key = max_db_period
+        min_period_key = max_period_key - months_back + 1
+
+    # Determine which years are covered in the filter range
+    min_year_filter = min_period_key // 12
+    max_year_filter = max_period_key // 12
+    
+    # Query distinct years from sales_data
+    distinct_years_res = db.execute(text("SELECT DISTINCT year FROM sales_data WHERE year IS NOT NULL")).fetchall()
+    all_years = sorted([int(yr[0]) for yr in distinct_years_res])
+    
+    if year is not None:
+        years_to_calculate = [year]
+    else:
+        years_to_calculate = [y for y in all_years if min_year_filter <= y <= max_year_filter]
+        if not years_to_calculate and all_years:
+            years_to_calculate = [all_years[-1]]  # Default to latest if somehow empty
 
     sql = """
     WITH raw_sales AS (
@@ -808,71 +881,32 @@ def run_sales_outcome_calculation(db: Session, year: Optional[int] = None):
     ORDER BY curr.year, curr.quarter, curr.month;
     """
 
-    export_df = pd.read_sql_query(text(sql), con=engine)
-    if export_df.empty:
+    dfs = []
+    for y in years_to_calculate:
+        df = pd.read_sql_query(text(sql), con=engine, params={"year": y})
+        if not df.empty:
+            dfs.append(df)
+            
+    if not dfs:
         export_df = pd.DataFrame(columns=[
             "sold_to_pt",
+            "sold_party_name",
             "year",
             "month",
             "product_category",
             "month_sales",
             "quarter_target",
-            "fraction_of_quarter",
+            "last_year_fraction_of_quarter",
             "monthly_target",
         ])
         return export_df, 0.0, 0.0, 0.0
 
-    # Calculate month numbers and period keys
-    export_df["month_num"] = export_df["month"].str.strip().str.lower().map(MONTH_NAME_TO_NUM).fillna(1).astype(int)
-    export_df["period_key"] = export_df["year"] * 12 + export_df["month_num"]
-
-    # 1. Determine unique periods from calculated outcomes to establish boundaries
-    periods_list = export_df[["year", "month_num"]].drop_duplicates().values.tolist()
-    if periods_list:
-        periods_list.sort(key=lambda x: x[0] * 12 + x[1])
-        min_db_period = periods_list[0][0] * 12 + periods_list[0][1]
-        max_db_period = periods_list[-1][0] * 12 + periods_list[-1][1]
-    else:
-        min_db_period = 2025 * 12 + 1
-        max_db_period = 2025 * 12 + 12
-
-    # Handle legacy year parameter
-    if year is not None and duration == "all" and not start_period and not end_period:
-        duration = "custom"
-        start_period = f"{year}-01"
-        end_period = f"{year}-12"
-
-    # Calculate active range boundaries
-    if duration == "all":
-        min_period_key = min_db_period
-        max_period_key = max_db_period
-    elif duration == "custom":
-        min_period_key = min_db_period
-        max_period_key = max_db_period
-        if start_period:
-            try:
-                sy, sm = map(int, start_period.split("-"))
-                min_period_key = sy * 12 + sm
-            except ValueError:
-                pass
-        if end_period:
-            try:
-                ey, em = map(int, end_period.split("-"))
-                max_period_key = ey * 12 + em
-            except ValueError:
-                pass
-    else:
-        months_back = 3
-        if duration == "1m":
-            months_back = 1
-        elif duration == "6m":
-            months_back = 6
-        elif duration == "12m":
-            months_back = 12
-        max_period_key = max_db_period
-        min_period_key = max_period_key - months_back + 1
+    export_df = pd.concat(dfs, ignore_index=True)
 
     # Filter in Python
+    export_df["month_num"] = export_df["month"].str.strip().str.lower().map(MONTH_NAME_TO_NUM).fillna(1).astype(int)
+    export_df["period_key"] = export_df["year"] * 12 + export_df["month_num"]
+    
     filtered_df = export_df[
         (export_df["period_key"] >= min_period_key) &
         (export_df["period_key"] <= max_period_key)
@@ -979,6 +1013,9 @@ def download_scheme_outcome(
 @router.get("/sales-outcome")
 def get_sales_outcome(
     year: Optional[int] = Query(None, description="Year for sales outcome calculation. Defaults to latest available year if omitted."),
+    duration: str = Query("all", description="Duration filter: all, 1m, 3m, 6m, 12m, custom"),
+    start_period: Optional[str] = Query(None, description="Start period: YYYY-MM"),
+    end_period: Optional[str] = Query(None, description="End period: YYYY-MM"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1039,6 +1076,9 @@ def get_sales_outcome(
 @router.get("/sales-outcome/download")
 def download_sales_outcome(
     year: Optional[int] = Query(None, description="Year for sales outcome calculation. Defaults to latest available year if omitted."),
+    duration: str = Query("all", description="Duration filter: all, 1m, 3m, 6m, 12m, custom"),
+    start_period: Optional[str] = Query(None, description="Start period: YYYY-MM"),
+    end_period: Optional[str] = Query(None, description="End period: YYYY-MM"),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
