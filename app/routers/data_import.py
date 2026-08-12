@@ -888,17 +888,16 @@ def run_sales_outcome_calculation(
             dfs.append(df)
             
     if not dfs:
-        export_df = pd.DataFrame(columns=[
-            "sold_to_pt",
-            "sold_party_name",
-            "year",
-            "month",
-            "product_category",
-            "month_sales",
-            "quarter_target",
-            "last_year_fraction_of_quarter",
-            "monthly_target",
-        ])
+        cols = ["sold_to_pt", "sold_party_name"]
+        for cat in ["FL", "TL", "Ref", "AC"]:
+            cols.append(f"{cat}_quarter_target")
+            cols.append(f"{cat}_monthly_target")
+            cols.append(f"{cat}_month_sales")
+            if cat == "FL":
+                cols.append("FL_last_year_fraction_of_quarter")
+                cols.append("FL_scheme_percentage")
+            cols.append(f"{cat}_achievement_pct")
+        export_df = pd.DataFrame(columns=cols)
         return export_df, 0.0, 0.0, 0.0
 
     export_df = pd.concat(dfs, ignore_index=True)
@@ -907,18 +906,95 @@ def run_sales_outcome_calculation(
     export_df["month_num"] = export_df["month"].str.strip().str.lower().map(MONTH_NAME_TO_NUM).fillna(1).astype(int)
     export_df["period_key"] = export_df["year"] * 12 + export_df["month_num"]
     
-    filtered_df = export_df[
+    filtered_raw_df = export_df[
         (export_df["period_key"] >= min_period_key) &
         (export_df["period_key"] <= max_period_key)
     ].copy()
 
-    # Drop intermediate filtering columns
-    filtered_df.drop(columns=["month_num", "period_key"], inplace=True, errors="ignore")
-
-    total_old = float(filtered_df["month_sales"].sum()) if "month_sales" in filtered_df.columns else 0.0
-    total_new = float(filtered_df["monthly_target"].sum()) if "monthly_target" in filtered_df.columns else 0.0
+    category_map = {
+        "FL": "FL",
+        "TL": "TL",
+        "REF": "Ref",
+        "REFPEDS": "Ref",
+        "AC": "AC"
+    }
+    
+    dealers = filtered_raw_df.groupby(["sold_to_pt", "sold_party_name"])
+    pivoted_rows = []
+    
+    for (sold_to_pt, sold_party_name), group in dealers:
+        row_data = {
+            "sold_to_pt": sold_to_pt,
+            "sold_party_name": sold_party_name
+        }
+        
+        categories = ["FL", "TL", "Ref", "AC"]
+        for cat in categories:
+            row_data[f"{cat}_quarter_target"] = 0.0
+            row_data[f"{cat}_monthly_target"] = 0.0
+            row_data[f"{cat}_month_sales"] = 0.0
+            if cat == "FL":
+                row_data[f"{cat}_last_year_fraction_of_quarter"] = 0.0
+                row_data[f"{cat}_scheme_percentage"] = 0.0
+            row_data[f"{cat}_achievement_pct"] = None
+            
+        for orig_cat, cat_group in group.groupby("product_category"):
+            mapped_cat = category_map.get(orig_cat)
+            if not mapped_cat:
+                continue
+                
+            q_target = float(cat_group["quarter_target"].sum())
+            m_target = float(cat_group["monthly_target"].sum())
+            sales = float(cat_group["month_sales"].sum())
+            
+            row_data[f"{mapped_cat}_quarter_target"] += q_target
+            row_data[f"{mapped_cat}_monthly_target"] += m_target
+            row_data[f"{mapped_cat}_month_sales"] += sales
+            
+            if mapped_cat == "FL":
+                avg_frac = float(cat_group["last_year_fraction_of_quarter"].mean())
+                row_data["FL_last_year_fraction_of_quarter"] = avg_frac
+                
+        # Calculate achievement percentages and scheme percentages
+        for cat in categories:
+            sales = row_data[f"{cat}_month_sales"]
+            target = row_data[f"{cat}_monthly_target"]
+            if target > 0:
+                ach = (sales / target) * 100
+                row_data[f"{cat}_achievement_pct"] = ach
+                if cat == "FL":
+                    if ach >= 100:
+                        row_data["FL_scheme_percentage"] = 8.0
+                    elif ach >= 95:
+                        row_data["FL_scheme_percentage"] = 5.0
+                    else:
+                        row_data["FL_scheme_percentage"] = 0.0
+            else:
+                row_data[f"{cat}_achievement_pct"] = None
+                if cat == "FL":
+                    row_data["FL_scheme_percentage"] = 0.0
+                    
+        pivoted_rows.append(row_data)
+        
+    if pivoted_rows:
+        pivoted_df = pd.DataFrame(pivoted_rows)
+    else:
+        cols = ["sold_to_pt", "sold_party_name"]
+        for cat in ["FL", "TL", "Ref", "AC"]:
+            cols.append(f"{cat}_quarter_target")
+            cols.append(f"{cat}_monthly_target")
+            cols.append(f"{cat}_month_sales")
+            if cat == "FL":
+                cols.append("FL_last_year_fraction_of_quarter")
+                cols.append("FL_scheme_percentage")
+            cols.append(f"{cat}_achievement_pct")
+        pivoted_df = pd.DataFrame(columns=cols)
+        
+    total_old = sum(float(pivoted_df[f"{cat}_month_sales"].sum()) for cat in ["FL", "TL", "Ref", "AC"]) if not pivoted_df.empty else 0.0
+    total_new = sum(float(pivoted_df[f"{cat}_monthly_target"].sum()) for cat in ["FL", "TL", "Ref", "AC"]) if not pivoted_df.empty else 0.0
     delta = total_old - total_new
-    return filtered_df, total_old, total_new, delta
+    
+    return pivoted_df, total_old, total_new, delta
 
 
 @router.get("/outcome")
@@ -1032,6 +1108,14 @@ def get_sales_outcome(
             for k, v in row.items():
                 if isinstance(v, float) and np.isnan(v):
                     row[k] = None
+
+        # Determine which product categories actually have sales data in the result
+        all_cats = ["FL", "TL", "Ref", "AC"]
+        available_categories = []
+        for cat in all_cats:
+            col = f"{cat}_month_sales"
+            if col in export_df.columns and export_df[col].sum() > 0:
+                available_categories.append(cat)
                     
         # Fetch distinct periods in database to return to UI
         res = db.execute(text("SELECT DISTINCT year, month FROM sales_data WHERE year IS NOT NULL AND month IS NOT NULL")).fetchall()
@@ -1060,7 +1144,8 @@ def get_sales_outcome(
                 "total_new": total_new,
                 "delta": delta
             },
-            "periods": distinct_periods_list
+            "periods": distinct_periods_list,
+            "available_categories": available_categories
         }
     except HTTPException as he:
         raise he
@@ -1084,35 +1169,107 @@ def download_sales_outcome(
 ):
     print(f"Inside the function download_sales_outcome with duration {duration}........")
     try:
+        import os
+        import openpyxl
+        
         export_df, total_old, total_new, delta = run_sales_outcome_calculation(
             db, year=year, duration=duration, start_period=start_period, end_period=end_period
         )
         
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            export_df.to_excel(writer, sheet_name="Sales_Outcome", index=False)
+        template_path = r"C:\Users\Urvesh Vernekar\Downloads\outputUI.xlsx"
+        
+        if os.path.exists(template_path):
+            wb = openpyxl.load_workbook(template_path)
+            ws = wb.active
+            # Clear old rows from Row 4 onwards
+            if ws.max_row >= 4:
+                ws.delete_rows(4, ws.max_row - 3)
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Sheet1"
             
-            start_row = len(export_df) + 2
-            try:
-                start_col = list(export_df.columns).index("month_sales")
-            except ValueError:
-                start_col = max(0, len(export_df.columns) - 4)
+            # Row 2 headers (Categories)
+            ws.merge_cells("C2:H2")
+            ws.cell(row=2, column=3, value="FL ")
+            ws.cell(row=2, column=10, value="TL ")
+            ws.cell(row=2, column=14, value="Ref ")
+            ws.cell(row=2, column=18, value="AC ")
+            
+            # Row 3 headers (Sub-columns)
+            headers_r3 = {
+                1: "sold to party ",
+                2: "sold party name",
+                3: "Quarter Target ",
+                4: "Monthly Target ",
+                5: "Actual Sales ",
+                6: "Fraction of Quarter ",
+                7: "Achieved/Not /percentage achieved  ",
+                8: "scheme percentage ",
+                10: "Quarter Target ",
+                11: "Monthly Target ",
+                12: "Actual Sales ",
+                13: "Achieved/Not /percentage achieved  ",
+                14: "Quarter Target ",
+                15: "Monthly Target ",
+                16: "Actual Sales ",
+                17: "Achieved/Not /percentage achieved  ",
+                18: "Quarter Target ",
+                19: "Monthly Target ",
+                20: "Actual Sales ",
+                21: "Achieved/Not /percentage achieved  "
+            }
+            for col_idx, val in headers_r3.items():
+                ws.cell(row=3, column=col_idx, value=val)
                 
-            summary_df = pd.DataFrame({
-                "Metric": ["Grand Total"],
-                "Old_discount": [total_old],
-                "New_discount": [total_new],
-                "Delta": [delta]
-            })
+        # Populate records starting from Row 4
+        current_row = 4
+        for idx, row in export_df.iterrows():
+            ws.cell(row=current_row, column=1, value=row.get("sold_to_pt"))
+            ws.cell(row=current_row, column=2, value=row.get("sold_party_name"))
             
-            summary_df.to_excel(
-                writer,
-                sheet_name="Sales_Outcome",
-                startrow=start_row,
-                startcol=start_col,
-                index=False
-            )
+            # FL
+            ws.cell(row=current_row, column=3, value=row.get("FL_quarter_target"))
+            ws.cell(row=current_row, column=4, value=row.get("FL_monthly_target"))
+            ws.cell(row=current_row, column=5, value=row.get("FL_month_sales"))
+            ws.cell(row=current_row, column=6, value=row.get("FL_last_year_fraction_of_quarter"))
+            ws.cell(row=current_row, column=7, value=row.get("FL_achievement_pct"))
+            ws.cell(row=current_row, column=8, value=row.get("FL_scheme_percentage"))
             
+            # TL
+            ws.cell(row=current_row, column=10, value=row.get("TL_quarter_target"))
+            ws.cell(row=current_row, column=11, value=row.get("TL_monthly_target"))
+            ws.cell(row=current_row, column=12, value=row.get("TL_month_sales"))
+            ws.cell(row=current_row, column=13, value=row.get("TL_achievement_pct"))
+            
+            # Ref
+            ws.cell(row=current_row, column=14, value=row.get("Ref_quarter_target"))
+            ws.cell(row=current_row, column=15, value=row.get("Ref_monthly_target"))
+            ws.cell(row=current_row, column=16, value=row.get("Ref_month_sales"))
+            ws.cell(row=current_row, column=17, value=row.get("Ref_achievement_pct"))
+            
+            # AC
+            ws.cell(row=current_row, column=18, value=row.get("AC_quarter_target"))
+            ws.cell(row=current_row, column=19, value=row.get("AC_monthly_target"))
+            ws.cell(row=current_row, column=20, value=row.get("AC_month_sales"))
+            ws.cell(row=current_row, column=21, value=row.get("AC_achievement_pct"))
+            
+            current_row += 1
+            
+        # Append Grand Total Row at the bottom
+        ws.cell(row=current_row, column=2, value="Grand Total")
+        # Sum Actual Sales and Monthly Targets across categories for Grand Total
+        ws.cell(row=current_row, column=5, value=sum(export_df[f"{c}_month_sales"].sum() for c in ["FL", "TL", "Ref", "AC"]))
+        ws.cell(row=current_row, column=4, value=sum(export_df[f"{c}_monthly_target"].sum() for c in ["FL", "TL", "Ref", "AC"]))
+        ws.cell(row=current_row, column=12, value=export_df["TL_month_sales"].sum())
+        ws.cell(row=current_row, column=11, value=export_df["TL_monthly_target"].sum())
+        ws.cell(row=current_row, column=16, value=export_df["Ref_month_sales"].sum())
+        ws.cell(row=current_row, column=15, value=export_df["Ref_monthly_target"].sum())
+        ws.cell(row=current_row, column=20, value=export_df["AC_month_sales"].sum())
+        ws.cell(row=current_row, column=19, value=export_df["AC_monthly_target"].sum())
+        
+        buffer = io.BytesIO()
+        wb.save(buffer)
         buffer.seek(0)
         
         headers = {
@@ -1126,6 +1283,8 @@ def download_sales_outcome(
     except HTTPException as he:
         raise he
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate spreadsheet download: {str(e)}"
