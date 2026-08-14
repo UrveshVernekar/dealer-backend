@@ -847,23 +847,23 @@ def run_sales_outcome_calculation(
             COALESCE(SUM(sd.inv_qty_bu::numeric), 0) AS month_sales,
 
             CASE
-                WHEN sd.month IN ('April','May','June') THEN 'Q1'
-                WHEN sd.month IN ('July','August','September') THEN 'Q2'
-                WHEN sd.month IN ('October','November','December') THEN 'Q3'
-                WHEN sd.month IN ('January','February','March') THEN 'Q4'
+                WHEN LOWER(TRIM(sd.month)) IN ('april','may','june') THEN 'Q1'
+                WHEN LOWER(TRIM(sd.month)) IN ('july','august','september') THEN 'Q2'
+                WHEN LOWER(TRIM(sd.month)) IN ('october','november','december') THEN 'Q3'
+                WHEN LOWER(TRIM(sd.month)) IN ('january','february','march') THEN 'Q4'
             END AS quarter,
 
             CASE
-                WHEN sd.month IN ('April','May','June') THEN td.q1
-                WHEN sd.month IN ('July','August','September') THEN td.q2
-                WHEN sd.month IN ('October','November','December') THEN td.q3
-                WHEN sd.month IN ('January','February','March') THEN td.q4
+                WHEN LOWER(TRIM(sd.month)) IN ('april','may','june') THEN td.q1
+                WHEN LOWER(TRIM(sd.month)) IN ('july','august','september') THEN td.q2
+                WHEN LOWER(TRIM(sd.month)) IN ('october','november','december') THEN td.q3
+                WHEN LOWER(TRIM(sd.month)) IN ('january','february','march') THEN td.q4
             END AS quarter_target
 
         FROM public.sales_data sd
         LEFT JOIN public.target_data td
-        ON sd.sold_to_pt = td.sold_to_code
-        AND sd.product_category = td.product
+        ON TRIM(sd.sold_to_pt) = TRIM(td.sold_to_code)
+        AND UPPER(TRIM(sd.product_category)) = UPPER(TRIM(td.product))
 
         -- Fetch both current year and last year
         WHERE sd.year IN (:year, :year - 1)
@@ -910,13 +910,15 @@ def run_sales_outcome_calculation(
         curr.month_sales,
         curr.quarter_target,
 
-        -- Fraction from the exact same month & quarter in (year - 1)
-        COALESCE(prev.yearly_month_fraction, 0) AS last_year_fraction_of_quarter,
+        -- Fraction from (year - 1) if available, else current year fraction, else 1/3 (0.33333333) as default
+        COALESCE(prev.yearly_month_fraction, curr.yearly_month_fraction, 0.33333333) AS last_year_fraction_of_quarter,
 
-        -- Current quarter target multiplied by last year's monthly weight
-        
-        COALESCE(curr.quarter_target, 0) * COALESCE(prev.yearly_month_fraction, 0)
-        AS monthly_target
+        -- Current quarter target multiplied by effective monthly weight
+        COALESCE(curr.quarter_target, 0) * COALESCE(
+            NULLIF(prev.yearly_month_fraction, 0),
+            NULLIF(curr.yearly_month_fraction, 0),
+            0.33333333
+        ) AS monthly_target
 
     FROM sales_with_fractions curr
 
@@ -924,7 +926,7 @@ def run_sales_outcome_calculation(
     LEFT JOIN sales_with_fractions prev
     ON curr.sold_to_pt = prev.sold_to_pt
     AND curr.product_category = prev.product_category
-    AND curr.month = prev.month
+    AND LOWER(TRIM(curr.month)) = LOWER(TRIM(prev.month))
     AND prev.year = curr.year - 1
 
     WHERE curr.year = :year
