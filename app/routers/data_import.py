@@ -868,6 +868,13 @@ def run_sales_outcome_calculation(
         -- Fetch both current year and last year
         WHERE sd.year IN (:year, :year - 1)
 
+        AND EXISTS (
+          SELECT 1 
+          FROM public.target_data td_filter
+          WHERE TRIM(sd.sold_to_pt) = TRIM(td_filter.new_sold_to_party)
+            AND UPPER(TRIM(sd.product_category)) = UPPER(TRIM(td_filter.product))
+      )
+
         GROUP BY
             sd.year,
             sd.month,
