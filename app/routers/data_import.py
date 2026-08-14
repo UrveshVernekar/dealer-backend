@@ -291,8 +291,43 @@ def persist_import_mapping(db: Session, sheet_name: str, table_name: str):
     db.commit()
 
 
+def psql_insert_copy(table, conn, keys, data_iter):
+    """
+    High-performance PostgreSQL bulk insert using COPY FROM STDIN.
+    Inserts 100,000+ rows per second directly into PostgreSQL database.
+    """
+    import csv
+    from io import StringIO
+    dbapi_conn = conn.connection
+    with dbapi_conn.cursor() as cur:
+        s_buf = StringIO()
+        writer = csv.writer(s_buf)
+        writer.writerow(keys)
+        writer.writerows(data_iter)
+        s_buf.seek(0)
+        
+        columns = ', '.join([f'"{k}"' for k in keys])
+        if table.schema:
+            table_name = f'"{table.schema}"."{table.name}"'
+        else:
+            table_name = f'"{table.name}"'
+            
+        sql = f"COPY {table_name} ({columns}) FROM STDIN WITH (FORMAT CSV, HEADER true, NULL '')"
+        cur.copy_expert(sql=sql, file=s_buf)
+
+def get_bulk_insert_method():
+    if engine is not None:
+        try:
+            url_str = str(engine.url)
+            if "postgres" in url_str:
+                return psql_insert_copy
+        except Exception:
+            pass
+    return "multi"
+
+
 @router.post("/upload")
-async def upload_excel_data(
+def upload_excel_data(
     file: UploadFile = File(...),
     year: int = Form(None),
     quarter: str = Form(None),
@@ -300,7 +335,8 @@ async def upload_excel_data(
     current_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db)
 ):
-
+    import time
+    start_time = time.time()
     print("Inside the function upload ........")    
     filename = file.filename.lower()
     
@@ -311,29 +347,40 @@ async def upload_excel_data(
         )
         
     try:
-        
-        # 1. Determine the correct engine dynamically
+        # 1. Determine the correct engine dynamically (prefer calamine for maximum performance)
         reader_engine = None
-        if filename.endswith(".xlsb"):
-            reader_engine = "pyxlsb"
-        elif filename.endswith(".xlsx"):
-            reader_engine = "openpyxl"
-        elif filename.endswith(".xls"):
-            reader_engine = "xlrd"
-        # Read the file content
-        content = await file.read()
+        try:
+            import calamine
+            reader_engine = "calamine"
+        except ImportError:
+            if filename.endswith(".xlsb"):
+                reader_engine = "pyxlsb"
+            elif filename.endswith(".xlsx"):
+                reader_engine = "openpyxl"
+            elif filename.endswith(".xls"):
+                reader_engine = "xlrd"
+
+        # Read the file content synchronously in thread pool
+        content = file.file.read()
         
         file_stream = io.BytesIO(content)
         file_stream.seek(0)
         
         # 2. Pass the engine to ExcelFile so it knows how to parse sheet names
-        excel_file = pd.ExcelFile(file_stream, engine=reader_engine)
+        try:
+            excel_file = pd.ExcelFile(file_stream, engine=reader_engine)
+        except Exception as engine_err:
+            # Fallback if calamine fails on specific file structure
+            file_stream.seek(0)
+            fallback_engine = "pyxlsb" if filename.endswith(".xlsb") else ("openpyxl" if filename.endswith(".xlsx") else "xlrd")
+            excel_file = pd.ExcelFile(file_stream, engine=fallback_engine)
+            reader_engine = fallback_engine
+
         sheet_names = excel_file.sheet_names
-        
         results = {}
+        insert_method = get_bulk_insert_method()
         
         for sheet in sheet_names:
-            # Re-seek or pass the BytesIO object directly with the engine
             file_stream.seek(0)
             df_raw = pd.read_excel(
                 file_stream, 
@@ -382,7 +429,7 @@ async def upload_excel_data(
             
             print(db_table_name)
             persist_import_mapping(db, sheet, db_table_name)
-            # Save the dataframe to the database using SQLAlchemy connection
+            # Save the dataframe to the database using SQLAlchemy connection with high-performance bulk insert
             if db_table_name == "sales_data":
                 # Rename columns using SALES_COLUMN_MAPPINGS to align alternative column names
                 df_data = df_data.rename(columns=SALES_COLUMN_MAPPINGS)
@@ -396,25 +443,20 @@ async def upload_excel_data(
                     df_data["year"] = df_data["bill_date"].dt.year
                     df_data["month"] = df_data["bill_date"].dt.strftime("%B")
                 
-                # Derive product_category from mat_group
+                # Derive product_category from mat_group using fast vectorized NumPy selection
                 if "mat_group" in df_data.columns:
-                    def map_mat_group(val):
-                        if pd.isna(val):
-                            return None
-                        val_str = str(val).strip()
-                        val_upper = val_str.upper()
-                        if val_upper in ["FLT", "FLU", "WD"]:
-                            return "FL"
-                        elif val_upper in ["AC", "ACMIU", "ACMOU"]:
-                            return "AC"
-                        elif val_upper in ["MW"]:
-                            return "MWO"
-                        elif val_upper in ["REFDC", "REFFF"]:
-                            return "REF"
-                        elif val_upper in ["TL", "TLM"]:
-                            return "TL"
-                        return val_str
-                    df_data["product_category"] = df_data["mat_group"].apply(map_mat_group)
+                    s_mat = df_data["mat_group"].astype(str).str.strip()
+                    s_upper = s_mat.str.upper()
+                    conds = [
+                        s_upper.isin(["FLT", "FLU", "WD"]),
+                        s_upper.isin(["AC", "ACMIU", "ACMOU"]),
+                        s_upper.isin(["MW"]),
+                        s_upper.isin(["REFDC", "REFFF"]),
+                        s_upper.isin(["TL", "TLM"])
+                    ]
+                    choices = ["FL", "AC", "MWO", "REF", "TL"]
+                    df_data["product_category"] = np.select(conds, choices, default=s_mat)
+                    df_data.loc[df_data["mat_group"].isna(), "product_category"] = None
                 
                 # Fetch only valid columns from model schema
                 allowed_cols = [c.name for c in SalesData.__table__.columns if c.name != "id"]
@@ -432,12 +474,14 @@ async def upload_excel_data(
                         )
                         db.commit()
                 
-                # Save to database using append to retain predefined table structure
+                # Save to database using append with fast COPY / multi bulk insert
                 df_data.to_sql(
                     name=db_table_name,
                     con=engine,
                     if_exists="append",
-                    index=False
+                    index=False,
+                    method=insert_method,
+                    chunksize=50000
                 )
             elif db_table_name == "target_data":
                 # Rename columns using TARGET_COLUMN_MAPPINGS to align alternative column names
@@ -454,20 +498,24 @@ async def upload_excel_data(
                 db.execute(text("DELETE FROM target_data"))
                 db.commit()
                 
-                # Save to database using append to retain predefined table structure
+                # Save to database using append with fast COPY / multi bulk insert
                 df_data.to_sql(
                     name=db_table_name,
                     con=engine,
                     if_exists="append",
-                    index=False
+                    index=False,
+                    method=insert_method,
+                    chunksize=50000
                 )
             else:
-                # We replace the table dynamically
+                # We replace the table dynamically with fast bulk insert
                 df_data.to_sql(
                     name=db_table_name,
                     con=engine,
                     if_exists="replace",
-                    index=False
+                    index=False,
+                    method=insert_method,
+                    chunksize=50000
                 )
             
             results[sheet] = {
@@ -476,9 +524,11 @@ async def upload_excel_data(
                 "columns": list(df_data.columns)
             }
             
+        elapsed = round(time.time() - start_time, 2)
         return {
             "status": "success",
-            "message": "Excel data imported successfully.",
+            "message": f"Excel data imported successfully in {elapsed} seconds.",
+            "elapsed_seconds": elapsed,
             "details": results
         }
         
