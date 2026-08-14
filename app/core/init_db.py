@@ -19,11 +19,15 @@ def init_db():
         print(f"Error creating database tables: {e}")
         return
 
-    # Add product_category column to sales_data if it does not exist
+    # Add product_category column and performance indices to sales_data if they do not exist
     db = SessionLocal()
     try:
         from sqlalchemy import text
         db.execute(text("ALTER TABLE sales_data ADD COLUMN IF NOT EXISTS product_category VARCHAR(50)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_sales_data_bill_date ON sales_data(bill_date)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_sales_data_year_month ON sales_data(year, month)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_sales_data_lookup ON sales_data(sold_to_pt, product_category, year)"))
+        db.execute(text("CREATE INDEX IF NOT EXISTS idx_target_data_lookup ON target_data(sold_to_code, product)"))
         db.commit()
     except Exception as e:
         print(f"Error migrating sales_data table: {e}")

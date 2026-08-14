@@ -16,7 +16,7 @@ class SalesData(Base):
     mat_group = Column(String(50), nullable=True)
     material = Column(String(50), nullable=True)
     material_description = Column(String(255), nullable=True)
-    inv_qty_bu = Column(Integer, nullable=True)
+    inv_qty_bu = Column(Float, nullable=True)
     dealer_pri = Column(Float, nullable=True)
     sale_price = Column(Float, nullable=True)
     basic_rate = Column(Float, nullable=True)
